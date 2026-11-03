@@ -1,0 +1,8 @@
+dayu_radio/build/
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+.DS_Store
+**/.DS_Store
+.vscode/
