@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32s3:FlashSize=16M,FlashMode=dio,PSRAM=opi,PartitionScheme=huge_app,CPUFreq=240,USBMode=hwcdc,CDCOnBoot=cdc",
+  "hardwareFolders": "/Users/dayu/Library/Arduino15/packages",
+  "otherLibrariesFolders": "/Users/dayu/Documents/Arduino/libraries",
+  "sketchLocation": "/Users/dayu/WorkBuddy/2026-11-02-10-50-15/Dayu-radio/dayu_radio"
+}

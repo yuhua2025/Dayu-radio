@@ -1,0 +1,20 @@
+/Users/dayu/WorkBuddy/2026-11-02-10-50-15/Dayu-radio/dayu_radio/build/core/MD5Builder.cpp.o: \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/MD5Builder.cpp \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/HEXBuilder.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/WString.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/pgmspace.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.12/include/newlib/platform_include/ctype.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/Stream.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/Print.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.12/include/newlib/platform_include/stdio.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/WString.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/Printable.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/MD5Builder.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.12/include/esp_system/include/esp_system.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.12/include/esp_common/include/esp_err.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.12/include/esp_common/include/esp_compiler.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.12/include/esp_common/include/esp_attr.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.12/include/esp_common/include/esp_bit_defs.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.12/include/esp_common/include/esp_idf_version.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.12/include/esp_rom/include/esp_rom_md5.h \
+ /Users/dayu/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/HashBuilder.h
