@@ -83,6 +83,8 @@
 #define SWITCH_PUMP_LOOPS  10     // 抢跑期间每次主循环调几次 audio.loop()（实测 10 比 3 快约 80ms）
 #define SWITCH_SPIN_DELAY  0      // 抢跑期间主循环延时（ms）；0 = 不停顿地吃数据
 #define SWITCH_GIVEUP_MS   9000   // 连上了但一直没声音，超过这么久就认为这个台死了，自动跳下一个
+#define DEAD_AIR_MS        4000   // 以为在播、却连续这么久没有音频样本输出 → 判定空播，
+                                  // 立刻 stopSong() 重连（见 dayu_radio.ino 的空播看门狗）
 #define SWITCH_RETRY_MS     700   // TCP 都没连上时，隔多久重试一次
 #define SWITCH_MAX_TRIES      2   // 同一个台最多连几次，还不行就跳下一个
 #define SWITCH_MAX_SKIPS     12   // 连续跳过这么多个台都失败，说明是网络问题，别再刷台了

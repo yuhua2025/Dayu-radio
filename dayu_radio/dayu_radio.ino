@@ -70,6 +70,10 @@ static uint32_t g_lastBar     = 0;   // 上次画进度条的时刻
 static uint8_t  g_failTries    = 0;  // 当前这个台连了几次
 static uint8_t  g_skipStreak   = 0;  // 连续跳过了几个台都没成功
 static bool     g_heardSound  = false;
+// ★ "出声"的判据是**真实送进 I2S 的样本数有没有变**（见 spectrum.cpp 的钩子），
+//   不是 audio.getBitRate()。这个基准值在每次 connecttohost 之后取，之后只要
+//   样本数变了就说明新流真的在出数据 —— 旧台在预热期还在响，用"时刻"比较会误判。
+static uint32_t g_sampleBase  = 0;
 
 // ---------------------------------------------------------------- 电台表
 static void buildList(const String& custom) {
@@ -439,6 +443,9 @@ static void playStation(uint16_t i, bool muteFirst = true) {
   g_tConnected = millis();
   g_lastTry = g_tConnected;
   g_playing = ok;
+  // ★ 出声基准：以"新连接建立"这一刻为界。之前预热期间旧台还在出样本，
+  //   之后的增量才是新流的。见文件顶部 g_sampleBase 的说明。
+  g_sampleBase = spectrumSampleCount();
   if (!ok) applyVolume(g_vol);   // 没连上别把用户晾在静音里，音量立即回位
 
   // 连上了就顺手把"下一个台"交给代理去暖着，等你按键时它已经就绪
@@ -957,8 +964,16 @@ void loop() {
 
   if (audio.isRunning()) g_playing = true;
 
-  // 第一次拿到解码后的码率，基本就是"活儿干完了、马上出声"的时刻
-  if (!g_heardSound && g_tSwitch && audio.getBitRate() > 0) {
+  // 第一次真的把样本送进 I2S，才算"活儿干完了、已经在响"。
+  // ★ 这里以前用 audio.getBitRate() > 0 —— 但音频库在内缓冲只有 128 字节时就
+  //   会建解码器、解析出 MP3 帧头，码率立刻 > 0，而真正输出还要再攒够起播门槛
+  //   （18KB 左右）。也就是说码率 > 0 只代表"摸到了帧头"。
+  //   一旦流僵在"建了解码器、但样本一个都没出来"的地方（CDN 半连接、代理刚吐完
+  //   头部就断供……），界面会显示"播放中"、淡入也做了，可喇叭是全静音；更糟的是
+  //   判成"已出声"之后，9 秒放弃和自动跳台这两条自动恢复路径全被跳过 ——
+  //   只能人工按一下下一个台。这就是"有时开机没声音，按一下换台才有"。
+  //   现在只看真实样本（spectrumSampleCount），骗不了人。
+  if (!g_heardSound && g_playing && spectrumSampleCount() != g_sampleBase) {
     g_heardSound = true;
     g_failTries = 0;
     g_skipStreak = 0;
@@ -996,6 +1011,55 @@ void loop() {
       // TCP 连上了但一个字节音频都没有：这个台大概停播了，自动跳下一个
       Serial.printf("[play] %u 号台 %us 没声音，跳过\n", (unsigned)g_idx, (unsigned)(since / 1000));
       skipStation();
+    }
+  }
+
+  // ---- 空播看门狗：以为在播，其实样本停了 ----
+  // 这是"开机没声音、按一下下一个台才响"的自动兜底：不管僵在哪一层（解码器卡在
+  // 半帧、代理吐完头就断供、I2S 侧停摆），只要样本计数不再增长，就跟用户按一下
+  // 换台完全等价地重来一次：stopSong() 把库里那套状态机整个清掉，再重新连。
+  // 判据用样本计数而不是音量/码率 —— 音量 0 时送的是全零样本，计数照样在涨，
+  // 所以静音坡道不会误触发；反过来"有码率没样本"正是要抓的病。
+  // 重连两次仍无数据 = 这个台的流本身是死的，换下一个（不再无限重连）。
+  {
+    static uint32_t s_lastCnt   = 0;
+    static uint32_t s_lastCntAt = 0;
+    static uint8_t  s_airTries  = 0;
+
+    uint32_t cnt = spectrumSampleCount();
+    if (cnt != s_lastCnt) {          // 有样本在出 = 正常，一切归零
+      s_lastCnt   = cnt;
+      s_lastCntAt = millis();
+      s_airTries  = 0;
+    }
+
+    bool paused = (int32_t)(millis() - g_deadPauseUntil) < 0;
+    // 基准取"最近一次有样本"和"本次换台起点"里较晚的那个：换台后一直没样本时
+    // 从换台那一刻起算，不会拿上一个台的安静时间冤枉新台。
+    uint32_t refAt = ((int32_t)(s_lastCntAt - g_tSwitch) > 0) ? s_lastCntAt : g_tSwitch;
+    // 每失败一次就把等待时间翻倍（4s → 8s → 放弃）：慢网络下"首包要 5 秒"的台
+    // 不该被 4 秒的急性子判死，但也不能无限等 —— 第二次就给它 8 秒。
+    uint32_t waitMs = DEAD_AIR_MS << (s_airTries > 2 ? 2 : s_airTries);
+    if (g_bootstrapped && g_playing && g_tSwitch && !paused &&
+        (uint32_t)(millis() - refAt) > waitMs) {
+      if (s_airTries >= 2) {
+        Serial.printf("[play] %u 号台重连后仍没有音频数据，跳过\n", (unsigned)g_idx);
+        s_airTries  = 0;
+        s_lastCntAt = millis();
+        skipStation();
+      } else {
+        ++s_airTries;
+        Serial.printf("[play] %u 号台 %ums 没有音频数据（音量 %d）→ 自动重连（第 %u 次）\n",
+                      (unsigned)g_idx, (unsigned)(millis() - refAt),
+                      (int)g_appliedVol, (unsigned)s_airTries);
+        audio.stopSong();              // 清掉库里的解码器/连接状态
+        g_heardSound = false;
+        g_playing    = false;
+        g_eof        = false;
+        s_lastCntAt  = millis();
+        // 已经没有声音在放了，不需要静音坡道（muteFirst=false），直接重连
+        playStation(g_idx, false);
+      }
     }
   }
 

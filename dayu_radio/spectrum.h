@@ -6,6 +6,8 @@
 // ============================================================================
 #pragma once
 
+#include <stdint.h>
+
 // 频谱风格（网页设置页下拉的顺序，别随意改：NVS 里存的是编号）
 enum SpecStyle {
   SPEC_HEAT    = 0,   // 热力柱：蓝→青→绿→黄（按高度着色）+ 橙色峰值点
@@ -29,5 +31,12 @@ void spectrumRedraw();
 // repaint=false 用于 setup 早期恢复配置：那时屏幕上是开机画面，不能往上推频谱块。
 void spectrumSetStyle(int style, bool repaint = true);
 int  spectrumGetStyle();
+
+// ---- 真实出声检测（给主循环判断"到底有没有在响"用）----
+// 音频库的 getBitRate()>0 只说明"摸到过帧头"（内缓冲 128 字节就建解码器了），
+// 不代表真有样本送往 I2S —— 用它判"出声"会把"僵住的半连接"当成"播放中"。
+// 这里直接数钩子里真实送出的样本，是唯一不会骗人的判据。
+uint32_t spectrumSampleCount();    // 累计送往 I2S 的样本数（单调递增，约 48000/秒·声道对）
+uint32_t spectrumSilentMs();       // 距最近一次"有内容"样本的毫秒数；从未有声返回 UINT32_MAX
 
 const char* spectrumStyleName(int style);

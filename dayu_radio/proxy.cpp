@@ -531,9 +531,11 @@ static void serveStep() {
 
 // ---------------------------------------------------------------- 任务
 static void proxyTask(void*) {
-  s_srv.begin();
-  s_srv.setNoDelay(true);
-  Serial.printf("[proxy] 监听 127.0.0.1:%d\n", PROXY_PORT);
+  // ★ 监听**不在这里**开。以前 s_srv.begin() 放在任务的第一行，而 proxyBegin()
+  //   是"建完任务就返回"，于是开机首播有可能在监听端口还没建好之前就
+  //   connecttohost(127.0.0.1) —— 直接吃一个连接失败，然后退回直连上游：
+  //   首播少一层缓冲，冷启动更容易卡在半连接上（"开机偶尔没声音"的成因之一）。
+  //   现在监听在 proxyBegin() 里同步建好，任务只负责循环。
   for (;;) {
     serveStep();
     preStep();
@@ -557,6 +559,12 @@ bool proxyBegin() {
       Serial.println("[proxy] 起播垫 PSRAM 分配失败，实时转发不攒垫");
     }
   }
+  // 先同步把监听建好，再起任务 —— 否则开机首播可能撞上"端口还没开"，
+  // 直接退回直连（见 proxyTask 里的说明）
+  s_srv.begin();
+  s_srv.setNoDelay(true);
+  Serial.printf("[proxy] 监听 127.0.0.1:%d\n", PROXY_PORT);
+
   BaseType_t r = xTaskCreatePinnedToCore(proxyTask, "proxy", 6144, nullptr, 2, nullptr, 0);
   if (r != pdPASS) {
     Serial.println("[proxy] 任务创建失败，不用代理");

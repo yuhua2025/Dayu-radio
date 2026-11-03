@@ -28,17 +28,39 @@
 static int16_t          s_pcm[PCM_N];
 static volatile uint32_t s_head = 0;     // 已写入总数（单调递增，取模访问）
 
+// ★ 出声检测（主循环用它判断"到底有没有在响"，判据见 spectrum.h）
+//   s_written ：累计送进 I2S 的样本数。只要解码器在出数据它就在涨 —— 音量 0 时
+//              送的是全零样本，它照样涨，所以"有没有数据"和"音量多大"是两件事。
+//   s_audibleAt：最近一次出现"非数字静音"样本的时刻。数字静音（全零）是精确的 0，
+//              所以一个极低的阈值就能把"真静音"和"很轻的音乐"分开。
+static volatile uint32_t s_written   = 0;
+static volatile uint32_t s_audibleAt = 0;
+#define AUDIBLE_PEAK 24                  // int16 域约 -62dBFS，压不住正常节目的弱音
+
 void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S) {
   *continueI2S = true;                   // 与库默认行为一致：继续送 I2S
   uint32_t h = s_head;
+  int32_t  peak = 0;
   for (int i = 0; i < validSamples; i++) {
     // 立体声混单声道，int32 高位域 → int16 域（先加后移防溢出偏置可忽略）
     int32_t m = (outBuff[2 * i] + outBuff[2 * i + 1]) >> 17;
     if (m > 32767)  m = 32767;
     if (m < -32768) m = -32768;
     s_pcm[h++ & (PCM_N - 1)] = (int16_t)m;
+    int32_t a = (m < 0) ? -m : m;
+    if (a > peak) peak = a;
   }
   s_head = h;
+  s_written += (uint32_t)validSamples;
+  if (peak > AUDIBLE_PEAK) s_audibleAt = millis();   // 只有真的有内容才取时间，省开销
+}
+
+uint32_t spectrumSampleCount() { return s_written; }
+
+uint32_t spectrumSilentMs() {
+  uint32_t at = s_audibleAt;
+  if (!at) return 0xFFFFFFFFu;
+  return millis() - at;
 }
 
 // ---------------------------------------------------------------- FFT

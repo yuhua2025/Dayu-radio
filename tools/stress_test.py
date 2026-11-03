@@ -45,12 +45,41 @@ log = []
 anomalies = []
 in_restart = False          # 我们自己发起 /restart 时，ESP-ROM 不算异常
 
+def reopen_serial(wait_s=25):
+    """ESP.restart() 后原生 USB CDC 会重新枚举，旧句柄直接失效（Errno 6）。
+    以前不重连的话，脚本会"看不见"设备开机 —— 于是把好好的重启判成
+    "没恢复播放"。这里关掉旧句柄、重新找端口打开。"""
+    global ser, in_restart
+    try:
+        ser.close()
+    except Exception:
+        pass
+    import glob
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        cands = [PORT] + sorted(glob.glob("/dev/cu.usbmodem*"))
+        for p in cands:
+            try:
+                s = serial.Serial(p, 115200, timeout=0.05)
+                s.setDTR(False); s.setRTS(False)
+                ser = s
+                in_restart = True     # 重开端口本身会拉一次复位，这条启动不算异常
+                return True
+            except Exception:
+                continue
+        time.sleep(0.4)
+    return False
+
 def pump(seconds, tag=""):
     """读串口，收集日志；顺手标记异常"""
     global in_restart
     t_end = time.time() + seconds
     while time.time() < t_end:
-        line = ser.readline()
+        try:
+            line = ser.readline()
+        except Exception:
+            reopen_serial()
+            continue
         if not line:
             continue
         s = line.decode("utf-8", "replace").strip()
@@ -77,7 +106,12 @@ def wait_sound(timeout=45):
     global in_restart
     t0 = time.time()
     while time.time() - t0 < timeout:
-        line = ser.readline()
+        try:
+            line = ser.readline()
+        except Exception:          # 重启把句柄带走了：重连后继续等
+            if not reopen_serial():
+                return None, None
+            continue
         if not line:
             continue
         s = line.decode("utf-8", "replace").strip()
@@ -204,6 +238,8 @@ for i in range(3):
     except Exception:
         pass
     time.sleep(3)
+    # ★ 重启会让 USB CDC 重新枚举，必须重开串口才有日志可读（否则永远等不到"出声"）
+    reopen_serial()
     pump(1)                       # 丢掉重启瞬间的残留
     ms, _ = wait_sound(45)
     print(f"  第{i+1}次重启：{'恢复播放 %dms' % (ms*1000) if ms else 'FAIL(没恢复)'}")
