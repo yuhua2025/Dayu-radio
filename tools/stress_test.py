@@ -43,6 +43,7 @@ ser.setDTR(False); ser.setRTS(False)
 
 log = []
 anomalies = []
+boot_events = []        # "[boot] 首播流程结束"：开机链路有没有走完
 in_restart = False          # 我们自己发起 /restart 时，ESP-ROM 不算异常
 
 def reopen_serial(wait_s=25):
@@ -88,8 +89,10 @@ def pump(seconds, tag=""):
         log.append(s)
         if tag:
             print(f"  {tag} {s}")
+        if "首播流程结束" in s:
+            boot_events.append(s)
         if "[wdt]" in s:
-            anomalies.append("看门狗重启：" + s)
+            anomalies.append(("开机流程卡死：" if "开机流程" in s else "看门狗重启：") + s)
         if "ESP-ROM" in s:
             if not in_restart:
                 anomalies.append("意外复位：" + s)
@@ -118,7 +121,10 @@ def wait_sound(timeout=45):
         if not s:
             continue
         log.append(s)
-        if "[wdt]" in s: anomalies.append("看门狗重启：" + s)
+        if "首播流程结束" in s:
+            boot_events.append(s)
+        if "[wdt]" in s:
+            anomalies.append(("开机流程卡死：" if "开机流程" in s else "看门狗重启：") + s)
         if "ESP-ROM" in s:
             if not in_restart:
                 anomalies.append("意外复位：" + s)
@@ -230,9 +236,14 @@ if dp > 65536:
     results.append(f"psram 掉了 {dp}B，疑似泄漏")
 
 # ---- 7. 重启 3 次 ----
+# ★ /restart 是软件重启（复位原因=软件重启），**不等于断电冷启动**。
+#   "断电后卡在播放界面不动"是冷上电特有的：路由器/光猫/DNS 还没就绪，
+#   开机首播那一串同步等待会全撞在一起。要复现必须手动拔电再上电，
+#   保持串口连接，看 [boot] 首播流程开始/结束、[play] 出声、有没有 [wdt] 开机流程。
 print("\n=== 7. 重启 3 次，每次都要自己恢复播放 ===")
 for i in range(3):
     in_restart = True
+    n_boot = len(boot_events)
     try:
         http("/restart", timeout=5)
     except Exception:
@@ -242,9 +253,15 @@ for i in range(3):
     reopen_serial()
     pump(1)                       # 丢掉重启瞬间的残留
     ms, _ = wait_sound(45)
-    print(f"  第{i+1}次重启：{'恢复播放 %dms' % (ms*1000) if ms else 'FAIL(没恢复)'}")
+    # USB CDC 重枚举可能吃掉开机前几行，所以这条只作诊断，不单独判失败
+    boot_seen = any("首播流程结束" in l for l in boot_events[n_boot:])
+    print(f"  第{i+1}次重启：{'恢复播放 %dms' % (ms*1000) if ms else 'FAIL(没恢复)'}"
+          f"  首播流程日志{'已见' if boot_seen else '未捕获(CDC 重枚举可能丢行)'}")
     if ms is None:
-        results.append(f"重启第{i+1}次没恢复播放")
+        results.append(f"重启第{i+1}次没恢复播放（首播流程日志{'已见' if boot_seen else '未见'}）")
+
+print("\n提示：软件重启 ≠ 断电冷启动。要验「断电后卡在播放界面」请手动断电再上电，"
+      "保持串口连接；卡住时按 p 看状态快照。")
 
 # ---- 汇总 ----
 print("\n" + "=" * 46)

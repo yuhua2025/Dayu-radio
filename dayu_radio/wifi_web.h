@@ -165,6 +165,7 @@ static bool netWait(uint32_t timeoutMs) {
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - t0 > timeoutMs) return false;
+    g_loopBeat = millis();          // 连 WiFi 是 setup 里的合法长等待，每圈喂心跳
     uiBootStep("正在连接 WiFi", 560 + (int)((millis() - t0) * 300 / timeoutMs));
     delay(120);
   }

@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# 本地助手工作区数据（不进公开仓库）
+.workbuddy/
+
+# arduino-cli 编译中间产物；发布镜像在 prebuilt/
+dayu_radio/build/
+tools/__pycache__/

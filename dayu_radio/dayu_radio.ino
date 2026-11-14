@@ -73,7 +73,11 @@ static bool     g_heardSound  = false;
 // ★ "出声"的判据是**真实送进 I2S 的样本数有没有变**（见 spectrum.cpp 的钩子），
 //   不是 audio.getBitRate()。这个基准值在每次 connecttohost 之后取，之后只要
 //   样本数变了就说明新流真的在出数据 —— 旧台在预热期还在响，用"时刻"比较会误判。
+//   "帧里有内容"的基准。样本数只能说明"链路在动"，全零样本照样让它涨；
+//   冷启动半连接时解码器可能持续吐零，界面写"播放中"而喇叭全静音。
+//   开机首播不静音，可以直接要求"可听"；换台静音坡道期间例外（见出声判定）。
 static uint32_t g_sampleBase  = 0;
+static uint32_t g_audibleBase = 0;
 
 // ---------------------------------------------------------------- 电台表
 static void buildList(const String& custom) {
@@ -179,26 +183,43 @@ static uint32_t g_deadUntil[MAX_STATIONS];
 
 // ---------------------------------------------------------------- 主循环看门狗
 // 网络异常时 audio 库内部可能长时间阻塞（读 socket 等超时），那种卡死没法从
-// 主循环内部恢复 —— 卡住的时候恰恰什么代码都跑不到。这里放一个独立任务盯着：
-// 12 秒收不到心跳就重启，让设备自己爬起来，而不是永久死在那里。
+// 主循环内部恢复 —— 卡住的时候恰恰什么代码都跑不到。这里放一个独立任务盯着。
 //
-// ★ 必须 "armed" 之后才生效（loop 跑起来那一刻才武装）：
-//   setup 里有合法的长等待 —— netWait() 连 WiFi 最长 15 秒（清配网/换网络时更久），
-//   提前生效就是"每 15 秒重启一次"的死循环，设备永远起不来。这个坑踩过一次。
-static volatile uint32_t g_loopBeat  = 0;
-static volatile bool     g_wdtArmed  = false;
+// ★ 两阶段阈值（2026-11 修「断电重启后卡在播放界面不动，没声音」）：
+//   旧版 g_wdtArmed 要到 loop() 第一圈才置 true，等于**整个 setup 不受保护**。
+//   而开机首播（DNS 预热 + warmWait + connecttohost 的响应头忙等 + 最多 4 轮
+//   死台递归）当时全在 setup 里跑。冷上电时路由器/光猫/DNS 往往还没就绪，
+//   这些秒级阻塞一串起来就是十几秒甚至挂死；屏幕停在刚画好的主界面
+//   （"连接中"），按键、时间、频谱全不动，看门狗却还没上岗 —— 用户看到的
+//   就是"卡在播放界面不动、不能自动播放"。
+//   现在：
+//     · 任务一建好就 armed，setup 挂死也能自己爬起来；
+//     · 开机/首播阶段用 35 秒（> netWait 15s + 老凭据迁移 8s + 首播最长阻塞），
+//       不误杀合法长等待；bootstrapAfterWifi() 一结束就切回 12 秒；
+//     · 首播本身从 setup 挪到 loop 第一圈（见 g_bootPending），受完整保护，
+//       执行前后界面与按键都由主循环维护。
+static volatile uint32_t g_loopBeat      = 0;
+static volatile bool     g_wdtArmed      = false;
+static volatile bool     g_wdtBootPhase  = true;   // true = 开机/首播阶段，阈值放宽
 
 static void loopWatchdogTask(void*) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
-    if (!g_wdtArmed) continue;               // setup 阶段不看门
-    if (millis() - g_loopBeat > 12000) {
-      Serial.println("[wdt] 主循环 12 秒无响应（音频库内部阻塞），强制重启");
+    if (!g_wdtArmed) continue;
+    uint32_t limit = g_wdtBootPhase ? 35000 : 12000;
+    if (millis() - g_loopBeat > limit) {
+      Serial.printf("[wdt] %s %u 秒无响应，强制重启\n",
+                    g_wdtBootPhase ? "开机流程" : "主循环", (unsigned)(limit / 1000));
       delay(60);
       ESP.restart();
     }
   }
 }
+
+// WiFi 连上后把首播流程挂到这里，由 loop() 第一圈执行（见文件底部）。
+// 不能在 setup 里直接开播：那段链路会阻塞好几秒，而 setup 阶段界面/按键/看门狗
+// 都还没就位，冷启动网络没就绪时就是一次"死机"。
+static bool g_bootPending = false;
 
 // ---------------------------------------------------------------- 网络流畅度
 // 右下角"播放中"后面那三个圆点。
@@ -445,7 +466,8 @@ static void playStation(uint16_t i, bool muteFirst = true) {
   g_playing = ok;
   // ★ 出声基准：以"新连接建立"这一刻为界。之前预热期间旧台还在出样本，
   //   之后的增量才是新流的。见文件顶部 g_sampleBase 的说明。
-  g_sampleBase = spectrumSampleCount();
+  g_sampleBase  = spectrumSampleCount();
+  g_audibleBase = spectrumAudibleCount();
   if (!ok) applyVolume(g_vol);   // 没连上别把用户晾在静音里，音量立即回位
 
   // 连上了就顺手把"下一个台"交给代理去暖着，等你按键时它已经就绪
@@ -502,8 +524,12 @@ static void setVolume(int v) {
 // visual=true = setup 直连成功路径（推进开机画面）；
 // visual=false = 配网成功后从 loop 的 netTask 进入（开机画面早就翻篇了）。
 void bootstrapAfterWifi(bool visual) {
+  uint32_t tBoot = millis();
   g_wifiOK       = true;
   g_bootstrapped = true;
+  g_bootPending  = false;          // 防止 loop 与 netTask 两条路径重复开播
+  g_loopBeat     = millis();
+  Serial.printf("[boot] 首播流程开始%s\n", visual ? "（开机直连）" : "（配网完成）");
   Serial.printf("[wifi] %s  RSSI %d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
   if (visual) uiBootStep("正在准备预取", 760);
@@ -514,10 +540,14 @@ void bootstrapAfterWifi(bool visual) {
   // 1.5 秒的连接超时。实测第一台因此连挂两次，被当成"死台"跳过 —— 第 3 次其实就通了。
   // 这里先把蜻蜓FM 的域名解析一次塞进缓存，62 个内置台就都不会再撞这个坑。
   // （自定义台可能在别的域名上，它们首次使用仍要各自解析一次，无法预知。）
+  // ★ WiFi.hostByName 是**同步阻塞**的：冷上电时路由器/光猫刚起来、DNS 还没通，
+  //   这一步可能卡好几秒。放在 loop 里（而不是 setup）才有人喂心跳、看门狗也醒着；
+  //   前后各喂一次，别让这段合法等待被自己人判死。
   {
     IPAddress ip;
     uint32_t tDns = millis();
     bool okDns = WiFi.hostByName("lhttp.qtfm.cn", ip);
+    g_loopBeat = millis();
     Serial.printf("[boot] DNS 预热 lhttp.qtfm.cn → %s（%ums）\n",
                   okDns ? ip.toString().c_str() : "失败",
                   (unsigned)(millis() - tDns));
@@ -530,6 +560,12 @@ void bootstrapAfterWifi(bool visual) {
   // ★ 首播不静音：没有旧台要盖，静音只会带来"连上了却没声音"的风险
   playStation(g_idx, false);
   uiTick(true);   // visual 路径：沿用原 setup 的收尾节奏；配网路径：从配网页切回主界面
+
+  // 开机阶段的长等待到此为止，看门狗恢复 12 秒的常规阈值
+  g_wdtBootPhase = false;
+  g_loopBeat     = millis();
+  Serial.printf("[boot] 首播流程结束（%ums，台 %u），看门狗切回 12s\n",
+                (unsigned)(millis() - tBoot), (unsigned)(g_idx + 1));
 }
 
 // ---------------------------------------------------------------- 按键
@@ -805,9 +841,15 @@ void setup() {
   g_btnBoot.begin(PIN_BTN_BOOT, BTN_MAIN_DEBOUNCE_MS);
 
   // 主循环看门狗：网络异常时音频库内部阻塞会让主循环彻底停摆，
-  // 那种情况下只有外部任务能救场（12 秒没心跳就重启）
+  // 那种情况下只有外部任务能救场。
+  // ★ 优先级 3（高于预取代理的 2）：卡死时高优先级任务可能把 core 0 占住，
+  //   看门狗必须还能被调度到，否则"独立任务"形同虚设。它每秒只醒一次、
+  //   几微秒就睡回去，不会跟音频争 CPU。
+  // ★ 这里就 armed：setup 阶段用 35 秒的宽松阈值（见看门狗段注释），
+  //   既不会误杀 15 秒的 WiFi 等待，也不会让 setup 挂死变成永久死机。
   g_loopBeat = millis();
-  xTaskCreatePinnedToCore(loopWatchdogTask, "loopWdt", 3072, nullptr, 1, nullptr, 0);
+  g_wdtArmed = true;
+  xTaskCreatePinnedToCore(loopWatchdogTask, "loopWdt", 3072, nullptr, 3, nullptr, 0);
 
   // 配网（自实现，见 wifi_web.h）。三种情况：
   //   ① 有自己存的凭据 → 直接连，15 秒内连上就走开机画面继续；
@@ -847,8 +889,14 @@ void setup() {
   webSetup();
 
   if (wifiConnected) {
-    bootstrapAfterWifi(true);
-    uiTick(true);                  // 联网成功才画主界面
+    // ★ 首播不在 setup 里跑（见 g_bootPending / 看门狗段的说明）：
+    //   开机首播那条链路会同步阻塞好几秒（DNS、预热、响应头、死台递归），
+    //   放在 setup 里就是"屏幕刚画好主界面就冻住、按键不动、看门狗没上岗"。
+    //   这里只把开机画面推到最后一步，然后立刻交回主循环；
+    //   loop 第一圈（已喂心跳、看门狗已 armed）再执行 bootstrapAfterWifi(true)。
+    g_wifiOK       = true;
+    g_bootPending  = true;
+    uiBootStep("准备开始播放", 900);
   } else {
     if (lastFailCode) Serial.printf("[boot] WiFi 连接失败 code=%d，转热点配网\n", lastFailCode);
     // startPortal() 内部已经画了配网画面 —— 这里绝不能再 uiTick(true)，
@@ -859,9 +907,16 @@ void setup() {
 
 // ---------------------------------------------------------------- loop
 void loop() {
-  // 第一圈 loop 才武装看门狗：setup 里的连接等待是合法的，不能算卡死
-  if (!g_wdtArmed) { g_wdtArmed = true; }
-  g_loopBeat = millis();          // 喂主循环看门狗（armed 后 12 秒没跳动就重启）
+  g_loopBeat = millis();          // 喂主循环看门狗
+
+  // ★ 首播流程从 setup 挪到这里（见 setup 末尾与看门狗段的说明）：
+  //   此刻看门狗已 armed、心跳在跳，DNS 预热/响应头忙等再慢也只是"慢"，
+  //   不会变成没人管的永久冻结；开机阶段阈值 35 秒兜住真正的挂死。
+  //   只有第一圈进来（bootstrapAfterWifi 里也会清这个标志，防重入）。
+  if (g_bootPending) {
+    g_bootPending = false;
+    bootstrapAfterWifi(true);
+  }
 
   // ★ 按键必须排在最前面。audio.loop() 要解包、要往 I2S 搬数据，抢跑窗口里
   //   还要连喂 10 次 —— 排在它后面就等于"按一下要等数据喂完才认"。
@@ -940,11 +995,12 @@ void loop() {
     audio.loop();
   }
 
-  // 串口命令（只保留运维/产测会用到的四条）
+  // 串口命令（运维/产测用）
   //   n = 下一个台（和按 BOOT 同一条路径）
   //   d = 把当前画面按 RGB565 原始帧吐到串口（核版式、截图用）
   //   w = 清除配网并重启
   //   e = 电池/充电诊断（电压、引脚电压、充电脚电平）
+  //   p = 播放状态机快照：卡在界面不动时，一眼分清"没数据 / 全零静音 / 音量被压住"
   while (Serial.available()) {
     int c = Serial.read();
     if (c == 'n' || c == 'N') {
@@ -959,6 +1015,18 @@ void loop() {
                     PIN_CHG_DET, digitalRead(PIN_CHG_DET),
                     batteryCharging() ? "充电中" : "用电池",
                     batteryMilliVolts(), batteryPinMilliVolts(), batteryPercent());
+    } else if (c == 'p' || c == 'P') {
+      uint32_t sm = spectrumSilentMs();
+      Serial.printf("[diag] up=%ums playing=%d heard=%d sinceSwitch=%ums "
+                    "vol=%d/%d fade=%d samples=%u audible=%u silent=%u "
+                    "proxy=%d wifi=%d boot=%d wdtPhase=%d reset=%s\n",
+                    (unsigned)millis(), (int)g_playing, (int)g_heardSound,
+                    g_tSwitch ? (unsigned)(millis() - g_tSwitch) : 0,
+                    (int)g_appliedVol, (int)g_vol, (int)g_fadeIn,
+                    (unsigned)spectrumSampleCount(), (unsigned)spectrumAudibleCount(),
+                    (unsigned)sm, (int)proxyReady(),
+                    (int)(WiFi.status() == WL_CONNECTED), (int)g_bootstrapped,
+                    (int)g_wdtBootPhase, resetReasonStr(esp_reset_reason()));
     }
   }
 
@@ -972,8 +1040,18 @@ void loop() {
   //   头部就断供……），界面会显示"播放中"、淡入也做了，可喇叭是全静音；更糟的是
   //   判成"已出声"之后，9 秒放弃和自动跳台这两条自动恢复路径全被跳过 ——
   //   只能人工按一下下一个台。这就是"有时开机没声音，按一下换台才有"。
-  //   现在只看真实样本（spectrumSampleCount），骗不了人。
-  if (!g_heardSound && g_playing && spectrumSampleCount() != g_sampleBase) {
+  //   现在看真实样本（spectrumSampleCount），骗不了人。
+  // ★ 再补一层：样本在涨 ≠ 有声音。半连接/坏帧时解码器可能持续吐**全零样本**，
+  //   I2S 一直在收数据、界面却该显示"播放中"而喇叭全静音，上次修的空播看门狗
+  //   （只看样本数）也抓不到。所以非静音状态下还要求"帧里有内容"：
+  //     · 静音坡道期间（换台把 appliedVol 压到 0，或用户把音量调到 0）
+  //       送出来的一定是全零，只能要求"链路在动"，否则淡入永远不启动、音量锁死在 0；
+  //     · 开机首播不静音（muteFirst=false），必须真有可听内容才算在响。
+  //   判不出声就保持 !g_heardSound，9 秒放弃/自动跳台这两条恢复路径才不会被跳过。
+  bool zeroRamp = (g_appliedVol == 0);
+  bool gotData  = spectrumSampleCount()  != g_sampleBase;
+  bool gotSound = spectrumAudibleCount() != g_audibleBase;
+  if (!g_heardSound && g_playing && gotData && (zeroRamp || gotSound)) {
     g_heardSound = true;
     g_failTries = 0;
     g_skipStreak = 0;
@@ -1024,39 +1102,57 @@ void loop() {
   {
     static uint32_t s_lastCnt   = 0;
     static uint32_t s_lastCntAt = 0;
+    static uint32_t s_lastAud   = 0;
+    static uint32_t s_lastAudAt = 0;
     static uint8_t  s_airTries  = 0;
 
+    uint32_t now = millis();
     uint32_t cnt = spectrumSampleCount();
-    if (cnt != s_lastCnt) {          // 有样本在出 = 正常，一切归零
-      s_lastCnt   = cnt;
-      s_lastCntAt = millis();
+    uint32_t aud = spectrumAudibleCount();
+    if (cnt != s_lastCnt) { s_lastCnt = cnt; s_lastCntAt = now; }
+    if (aud != s_lastAud) {          // 真有内容出来过 = 正常，失败计数归零
+      s_lastAud   = aud;
+      s_lastAudAt = now;
       s_airTries  = 0;
     }
 
-    bool paused = (int32_t)(millis() - g_deadPauseUntil) < 0;
-    // 基准取"最近一次有样本"和"本次换台起点"里较晚的那个：换台后一直没样本时
+    bool paused = (int32_t)(now - g_deadPauseUntil) < 0;
+    // 基准取"最近一次有进展"和"本次换台起点"里较晚的那个：换台后一直没数据时
     // 从换台那一刻起算，不会拿上一个台的安静时间冤枉新台。
-    uint32_t refAt = ((int32_t)(s_lastCntAt - g_tSwitch) > 0) ? s_lastCntAt : g_tSwitch;
+    uint32_t refAt    = ((int32_t)(s_lastCntAt - g_tSwitch) > 0) ? s_lastCntAt : g_tSwitch;
+    uint32_t refAudAt = ((int32_t)(s_lastAudAt - g_tSwitch) > 0) ? s_lastAudAt : g_tSwitch;
     // 每失败一次就把等待时间翻倍（4s → 8s → 放弃）：慢网络下"首包要 5 秒"的台
     // 不该被 4 秒的急性子判死，但也不能无限等 —— 第二次就给它 8 秒。
     uint32_t waitMs = DEAD_AIR_MS << (s_airTries > 2 ? 2 : s_airTries);
-    if (g_bootstrapped && g_playing && g_tSwitch && !paused &&
-        (uint32_t)(millis() - refAt) > waitMs) {
+
+    // ① 样本计数停了 = 链路断了（原来的判据）。
+    // ② 样本还在涨、却一直是可听计数不涨 = 解码器在吐全零（半连接/坏帧）。
+    //    只在音量坡道走完、用户也没主动静音时才认：换台淡入期间本来就是全零，
+    //    那时要判空播就会把音量永远锁在 0。给 8 秒额外宽限，避免电台正常静场
+    //    （广告/转场）被误伤；触发后 playStation 会刷新 g_tSwitch，计时自动重来。
+    bool rampDone = (g_vol > 0 && g_appliedVol >= g_vol);
+    bool noData   = (now - refAt) > waitMs;
+    bool allZero  = rampDone && (now - refAudAt) > waitMs + 8000;
+
+    if (g_bootstrapped && g_playing && g_tSwitch && !paused && (noData || allZero)) {
       if (s_airTries >= 2) {
         Serial.printf("[play] %u 号台重连后仍没有音频数据，跳过\n", (unsigned)g_idx);
         s_airTries  = 0;
-        s_lastCntAt = millis();
+        s_lastCntAt = now;
+        s_lastAudAt = now;
         skipStation();
       } else {
         ++s_airTries;
-        Serial.printf("[play] %u 号台 %ums 没有音频数据（音量 %d）→ 自动重连（第 %u 次）\n",
-                      (unsigned)g_idx, (unsigned)(millis() - refAt),
+        Serial.printf("[play] %u 号台 %ums %s（音量 %d）→ 自动重连（第 %u 次）\n",
+                      (unsigned)g_idx, (unsigned)(now - (noData ? refAt : refAudAt)),
+                      noData ? "没有音频数据" : "只有全零静音样本",
                       (int)g_appliedVol, (unsigned)s_airTries);
         audio.stopSong();              // 清掉库里的解码器/连接状态
         g_heardSound = false;
         g_playing    = false;
         g_eof        = false;
-        s_lastCntAt  = millis();
+        s_lastCntAt  = now;
+        s_lastAudAt  = now;
         // 已经没有声音在放了，不需要静音坡道（muteFirst=false），直接重连
         playStation(g_idx, false);
       }

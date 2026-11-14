@@ -29,19 +29,32 @@ static int16_t          s_pcm[PCM_N];
 static volatile uint32_t s_head = 0;     // 已写入总数（单调递增，取模访问）
 
 // ★ 出声检测（主循环用它判断"到底有没有在响"，判据见 spectrum.h）
-//   s_written ：累计送进 I2S 的样本数。只要解码器在出数据它就在涨 —— 音量 0 时
-//              送的是全零样本，它照样涨，所以"有没有数据"和"音量多大"是两件事。
+//   s_written ：累计送进 I2S 的**帧数**（一帧 = 左右各一个 int32 word）。
+//              只要解码器在出数据它就在涨 —— 音量 0 时送的是全零样本，
+//              它照样涨，所以"链路有没有在送数据"和"音量多大"是两件事。
+//   s_audible ：累计"帧里有内容"的帧数。半连接/坏帧时解码器可能持续吐全零，
+//              s_written 照涨，只有这一项能戳穿"界面显示播放中、喇叭全静音"。
 //   s_audibleAt：最近一次出现"非数字静音"样本的时刻。数字静音（全零）是精确的 0，
 //              所以一个极低的阈值就能把"真静音"和"很轻的音乐"分开。
 static volatile uint32_t s_written   = 0;
+static volatile uint32_t s_audible   = 0;
 static volatile uint32_t s_audibleAt = 0;
 #define AUDIBLE_PEAK 24                  // int16 域约 -62dBFS，压不住正常节目的弱音
 
 void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S) {
   *continueI2S = true;                   // 与库默认行为一致：继续送 I2S
+
+  // ★ 库传进来的 validSamples 其实是 **int32 word 数**（Audio.cpp:3891 传的是
+  //   readWords，cacheSamples() 里也写明 sourceWords = m_validSamples * 2）。
+  //   老代码按 validSamples "帧"去读 outBuff[2*i+1]，等于越界读了整整一倍缓冲，
+  //   读到的是 DMA 工作区后面的旧数据：频谱里混进假样本，可听判据也会被污染。
+  //   一帧立体声 = 2 个 word，所以帧数是它的一半。
+  int frames = (int)validSamples / 2;
+  if (frames <= 0) return;
+
   uint32_t h = s_head;
   int32_t  peak = 0;
-  for (int i = 0; i < validSamples; i++) {
+  for (int i = 0; i < frames; i++) {
     // 立体声混单声道，int32 高位域 → int16 域（先加后移防溢出偏置可忽略）
     int32_t m = (outBuff[2 * i] + outBuff[2 * i + 1]) >> 17;
     if (m > 32767)  m = 32767;
@@ -51,11 +64,15 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
     if (a > peak) peak = a;
   }
   s_head = h;
-  s_written += (uint32_t)validSamples;
-  if (peak > AUDIBLE_PEAK) s_audibleAt = millis();   // 只有真的有内容才取时间，省开销
+  s_written += (uint32_t)frames;
+  if (peak > AUDIBLE_PEAK) {
+    s_audible += (uint32_t)frames;
+    s_audibleAt = millis();   // 只有真的有内容才取时间，省开销
+  }
 }
 
-uint32_t spectrumSampleCount() { return s_written; }
+uint32_t spectrumSampleCount()  { return s_written; }
+uint32_t spectrumAudibleCount() { return s_audible; }
 
 uint32_t spectrumSilentMs() {
   uint32_t at = s_audibleAt;
